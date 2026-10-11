@@ -1,5 +1,4 @@
 import datetime
-import re
 import pandas as pd
 import streamlit as st
 
@@ -31,38 +30,61 @@ def is_normal_hour(dt: datetime.datetime) -> bool:
     return False
 
 
-def parse_whatsapp_chat(text_content):
+def parse_whatsapp_chat_bulletproof(text_content):
     seferler = []
-    # Şoförlerin gruptaki isim takibi
     aktif_isler = {"Önal": None, "Salih": None, "Hasib": None}
 
-    # ÇOK ESNEK REGEX: Köşeli parantez içindeki her türlü tarih ve saat formatını yakalar
-    pattern = r"\[(\d+/\d+/\d+),\s+([^\]]+)\]\s+([^:]+):\s+(.*)"
-
     for line in text_content.split("\n"):
-        match = re.match(pattern, line)
-        if not match:
+        line = line.strip()
+        if not line or "[" not in line or "]" not in line:
             continue
 
-        date_str, time_str, sender, msg = match.groups()
-
-        # Tarih ayrıştırma mekanizması (AM/PM veya 24 saat formatına uyumlu)
+        # Tarih ve mesajı ayır
         try:
-            time_clean = time_str.strip()
-            # Eğer saniyeden sonra AM/PM varsa ona göre oku
-            if "AM" in time_clean or "PM" in time_clean:
-                dt = datetime.datetime.strptime(
-                    f"{date_str} {time_clean}", "%m/%d/%y %I:%M:%S %p"
-                )
-            else:
-                dt = datetime.datetime.strptime(
-                    f"{date_str} {time_clean}", "%m/%d/%y %H:%M:%S"
-                )
+            close_bracket_idx = line.find("]")
+            timestamp_part = line[1:close_bracket_idx]
+            remainder = line[close_bracket_idx + 1 :].strip()
+
+            # Baştaki tire işaretini temizle (varsa)
+            if remainder.startswith("-"):
+                remainder = remainder[1:].strip()
+
+            if ":" not in remainder:
+                continue
+
+            sender_part, msg_part = remainder.split(":", 1)
+            sender_lower = sender_part.lower()
+            msg_lower = msg_part.lower()
+            msg_clean = msg_part.strip()
         except:
             continue
 
-        # Şoför ismi eşleştirme varyasyonları
-        sender_lower = sender.lower()
+        # Tarih ve saat ayrıştırma (Çok esnek format denemesi)
+        dt = None
+        time_formats = [
+            "%m/%d/%y, %I:%M:%S %p",
+            "%m/%d/%y, %H:%M:%S",
+            "%d.%m.%Y %H:%M",
+            "%H:%M",
+        ]
+        for tf in time_formats:
+            try:
+                dt = datetime.datetime.strptime(timestamp_part.strip(), tf)
+                break
+            except:
+                continue
+
+        if not dt:
+            # Sadece saat varsa bugünün tarihini ekle
+            try:
+                dt_time = datetime.datetime.strptime(
+                    timestamp_part.strip(), "%H:%M"
+                ).time()
+                dt = datetime.datetime.combine(datetime.date.today(), dt_time)
+            except:
+                continue
+
+        # Şoför İsmi Belirleme
         driver_name = ""
         if "önal" in sender_lower or "ünal" in sender_lower:
             driver_name = "Önal"
@@ -72,31 +94,33 @@ def parse_whatsapp_chat(text_content):
             driver_name = "Hasib"
 
         if not driver_name:
-            continue  # Operasyon yöneticisi mesajlarını atla
+            continue
 
-        msg_lower = msg.lower()
-
-        # Medyasız dökümdeki albüm ve görsel uyarı satırlarını temizleme
+        # Temizlik
         if "<görsel dahil edilmedi>" in msg_lower or "<album mesajı>" in msg_lower:
             msg_clean = (
-                msg.replace("<görsel dahil edilmedi>", "")
+                msg_clean.replace("<görsel dahil edilmedi>", "")
                 .replace("<album mesajı>", "")
                 .strip()
             )
             msg_lower = msg_clean.lower()
-        else:
-            msg_clean = msg.strip()
 
         if not msg_lower:
             continue
 
-        # --- İŞ BAŞLANGIÇ SİNYALLERİ ---
+        # --- SEFER BAŞLANGIÇ VE BİTİŞ SİNYALLERİ ---
         is_start = any(
             x in msg_lower
-            for x in ["alındı", "başlandı", "çıkış yaptım", "çıkış yapıldı", "yüklendi", "dc"]
+            for x in [
+                "alındı",
+                "başlandı",
+                "çıkış yaptım",
+                "çıkış yapıldı",
+                "yüklendi",
+                "hazır",
+                "alacağız",
+            ]
         ) and not any(x in msg_lower for x in ["teslim", "edildi", "ettim"])
-
-        # --- İŞ BİTİŞ SİNYALLERİ ---
         is_end = any(
             x in msg_lower for x in ["teslim", "edildi", "ettim", "bitti"]
         )
@@ -112,7 +136,6 @@ def parse_whatsapp_chat(text_content):
                 "route_details": msg_clean,
             }
         elif is_end:
-            # Hafızada bekleyen iş varsa kapat
             if aktif_isler[driver_name] is not None:
                 start_info = aktif_isler[driver_name]
                 start_is_normal = is_normal_hour(start_info["start_time"])
@@ -137,18 +160,25 @@ def parse_whatsapp_chat(text_content):
                         "Prim Çarpanı": f"{multiplier}X",
                         "Prim Tutarı (TL)": base_premium * multiplier,
                         "Çift 20'lik mi?": (
-                            "Evet (Tek Sefer)" if start_info["double_20"] else "Hayır"
+                            "Evet" if start_info["double_20"] else "Hayır"
                         ),
                     }
                 )
                 aktif_isler[driver_name] = None
             else:
-                # Hafızada iş yoksa ama mesajın kendisi güzergah içeriyorsa (Örn: Demirellerden limana teslim edildi)
-                if any(x in msg_lower for x in ["depo", "liman", "ardep", "ciss", "gts"]):
-                    start_is_normal = is_normal_hour(dt - datetime.timedelta(hours=1))
+                # Hafızada iş yoksa doğrudan mesaj içeriğinden rota çıkar
+                if any(
+                    x in msg_lower
+                    for x in ["depo", "liman", "ardep", "ciss", "gts"]
+                ):
+                    start_is_normal = is_normal_hour(
+                        dt - datetime.timedelta(hours=1)
+                    )
                     end_is_normal = is_normal_hour(dt)
                     base_premium = 600 if "soda" in msg_lower else 250
-                    multiplier = 2 if (not start_is_normal and not end_is_normal) else 1
+                    multiplier = (
+                        2 if (not start_is_normal and not end_is_normal) else 1
+                    )
 
                     seferler.append(
                         {
@@ -159,9 +189,7 @@ def parse_whatsapp_chat(text_content):
                             "Teslim Etme": dt.strftime("%d/%m/%Y %H:%M"),
                             "Prim Çarpanı": f"{multiplier}X",
                             "Prim Tutarı (TL)": base_premium * multiplier,
-                            "Çift 20'lik mi?": (
-                                "Evet (Tek Sefer)" if is_double_20 else "Hayır"
-                            ),
+                            "Çift 20'lik mi?": "Evet" if is_double_20 else "Hayır",
                         }
                     )
 
@@ -169,10 +197,10 @@ def parse_whatsapp_chat(text_content):
 
 
 # --- STREAMLIT MOBIL ARAYÜZ TASARIMI ---
-st.set_page_config(page_title="Tır Optimizasyon v1.2", layout="centered")
+st.set_page_config(page_title="Tır Optimizasyon v1.3", layout="centered")
 
 st.title("🚛 Nakliye Maliyet & Rota Optimizasyonu")
-st.caption("Medyasız WhatsApp Metin Okuma Filtresi Aktif")
+st.caption("Geliştirilmiş Kesin Çözümlü Metin İşleyici Aktif")
 
 st.sidebar.header("⛽ Günlük Girişler")
 mazot_litre = st.sidebar.number_input(
@@ -197,7 +225,7 @@ whatsapp_file = st.file_uploader(
 
 if whatsapp_file is not None:
     chat_text = whatsapp_file.read().decode("utf-8")
-    df_seferler = parse_whatsapp_chat(chat_text)
+    df_seferler = parse_whatsapp_chat_bulletproof(chat_text)
 
     if not df_seferler.empty:
         st.success(
@@ -237,5 +265,5 @@ if whatsapp_file is not None:
         st.dataframe(df_seferler, use_container_width=True)
     else:
         st.error(
-            "Yüklenen dosya formatı çözülemedi. Lütfen şoförlerin gruptaki isimlerini veya mesaj biçimlerini kontrol edin."
+            "Dosya yapısı çözümlenemedi. Lütfen yüklediğiniz dosyanın boş veya hatalı olmadığından emin olun."
         )
