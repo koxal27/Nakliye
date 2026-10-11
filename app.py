@@ -1,4 +1,6 @@
 import datetime
+import io
+import zipfile
 import pandas as pd
 import streamlit as st
 
@@ -32,9 +34,9 @@ def is_normal_hour(dt: datetime.datetime) -> bool:
 
 def parse_whatsapp_bulletproof_final(text_content):
     seferler = []
-    # Kim ne iş yapıyor takibi için aktif havuz
     aktif_isler = {}
 
+    # Metni normalize et
     text_content = (
         text_content.replace("\x00", "")
         .replace("\ufeff", "")
@@ -46,16 +48,25 @@ def parse_whatsapp_bulletproof_final(text_content):
 
     for satir in satirlar:
         satir = satir.strip()
-        if not satir or "[" not in satir or "]" not in satir:
+        if not satir:
             continue
 
         satir_lower = satir.lower()
 
-        # Köşeli parantez içinden zamanı temizle
+        # Tarih/saat kısmını ve mesajı ayır (Format bağımsız esnek tarama)
         try:
-            close_idx = satir.find("]")
-            timestamp_part = satir[1:close_idx].strip()
-            remainder = satir[close_idx + 1 :].strip()
+            if "[" in satir and "]" in satir:
+                open_idx = satir.find("[")
+                close_idx = satir.find("]")
+                timestamp_part = satir[open_idx + 1 : close_idx].strip()
+                remainder = satir[close_idx + 1 :].strip()
+            else:
+                # Köşeli parantez yoksa tire işaretine göre dene
+                if " - " in satir:
+                    timestamp_part, remainder = satir.split(" - ", 1)
+                else:
+                    continue
+
             if remainder.startswith("-"):
                 remainder = remainder[1:].strip()
 
@@ -79,7 +90,7 @@ def parse_whatsapp_bulletproof_final(text_content):
         elif "hasib" in sender_lower or "selahattin" in sender_lower or "alc 272" in sender_lower:
             driver_name = "Hasib"
         elif "garaj" in sender_lower:
-            driver_name = "Önal"  # Garaj hesabından yazılan iş başlangıçları için emniyet
+            driver_name = "Önal"
 
         # Tarih formatı esnetme
         dt = None
@@ -158,7 +169,6 @@ def parse_whatsapp_bulletproof_final(text_content):
                 )
                 aktif_isler[driver_name] = None
             else:
-                # Emniyet Modu: Doğrudan teslim mesajından sefer üret
                 if any(x in msg_lower for x in ["depo", "liman", "ardep", "ciss", "gts", "falcon", "demirel"]):
                     start_is_normal = is_normal_hour(dt - datetime.timedelta(hours=1))
                     end_is_normal = is_normal_hour(dt)
@@ -185,7 +195,7 @@ def parse_whatsapp_bulletproof_final(text_content):
 st.set_page_config(page_title="Mersin Konteynır Takip", layout="centered")
 
 st.title("🚛 Tır Maliyet & Rota Optimizasyonu")
-st.caption("Geliştirilmiş Esnek Metin İşleme Modülü")
+st.caption("Otomatik ZIP ve Metin Çözücü Akıllı Motor Aktif")
 
 st.sidebar.header("⛽ Günlük Yakıt Girişleri")
 mazot_litre = st.sidebar.number_input("Toplam Alınan Mazot (Litre)", min_value=0.0, value=150.0)
@@ -200,32 +210,48 @@ st.subheader("📂 Veri Giriş Kaynakları")
 whatsapp_file = st.file_uploader("WhatsApp Sohbet Dökümünü Yükleyin", type=["txt", "md"])
 
 if whatsapp_file is not None:
-    chat_text = whatsapp_file.read().decode("utf-8", errors="ignore")
-    df_seferler = parse_whatsapp_bulletproof_final(chat_text)
+    file_bytes = whatsapp_file.read()
+    chat_text = ""
 
-    if not df_seferler.empty:
-        st.success(f"✅ Başarılı! {len(df_seferler)} adet sefer hesaplandı ve listelendi!")
-
-        st.subheader("📊 Dönemlik Finansal Rapor")
-        col1, col2 = st.columns(2)
-
-        toplam_prim = df_seferler["Hak Ediş (TL)"].sum()
-
-        toplam_ciro = 0
-        for _, row in df_seferler.iterrows():
-            fiyat = SODA_FIYAT_BASE if row["İş Tipi"] == "Soda Operasyonu" else 3500.0
-            toplam_ciro += fiyat * (1 + KDV_ORANI)
-
-        net_kar = toplam_ciro - toplam_prim - toplam_yakit_maliyeti
-
-        with col1:
-            st.metric(label="Brüt Ciro (KDV Dahil)", value=f"{toplam_ciro:,.2f} TL")
-            st.metric(label="Toplam Ödenen Prim", value=f"{toplam_prim:,} TL")
-        with col2:
-            st.metric(label="Yakıt Maliyeti", value=f"{toplam_yakit_maliyeti:,} TL")
-            st.metric(label="Net Kar (Yol)", value=f"{net_kar:,.2f} TL")
-
-        st.subheader("📋 Hesaplanan Sefer Detayları")
-        st.dataframe(df_seferler, use_container_width=True)
+    # AKILLI DEDEKTÖR: Dosya gizli bir ZIP mi yoksa saf metin mi kontrol et
+    if zipfile.is_zipfile(io.BytesIO(file_bytes)):
+        with zipfile.ZipFile(io.BytesIO(file_bytes)) as z:
+            # ZIP içindeki ilk .txt veya .md dosyasını bul ve oku
+            for name in z.namelist():
+                if name.endswith(".txt") or name.endswith(".md"):
+                    chat_text = z.read(name).decode("utf-8", errors="ignore")
+                    break
     else:
-        st.error("Yüklenen dosya okundu ancak geçerli nakliye güzergahı içeren satırlar ayrıştırılamadı. Lütfen şoför mesaj formatından emin olun.")
+        chat_text = file_bytes.decode("utf-8", errors="ignore")
+
+    if chat_text:
+        df_seferler = parse_whatsapp_bulletproof_final(chat_text)
+
+        if not df_seferler.empty:
+            st.success(f"✅ Başarılı! Gizli paket çözüldü ve {len(df_seferler)} adet sefer hesaplandı!")
+
+            st.subheader("📊 Dönemlik Finansal Rapor")
+            col1, col2 = st.columns(2)
+
+            toplam_prim = df_seferler["Hak Ediş (TL)"].sum()
+
+            toplam_ciro = 0
+            for _, row in df_seferler.iterrows():
+                fiyat = SODA_FIYAT_BASE if row["İş Tipi"] == "Soda Operasyonu" else 3500.0
+                toplam_ciro += fiyat * (1 + KDV_ORANI)
+
+            net_kar = toplam_ciro - toplam_prim - toplam_yakit_maliyeti
+
+            with col1:
+                st.metric(label="Brüt Ciro (KDV Dahil)", value=f"{toplam_ciro:,.2f} TL")
+                st.metric(label="Toplam Ödenen Prim", value=f"{toplam_prim:,} TL")
+            with col2:
+                st.metric(label="Yakıt Maliyeti", value=f"{toplam_yakit_maliyeti:,} TL")
+                st.metric(label="Net Kar (Yol)", value=f"{net_kar:,.2f} TL")
+
+            st.subheader("📋 Hesaplanan Sefer Detayları")
+            st.dataframe(df_seferler, use_container_width=True)
+        else:
+            st.error("Dosya açıldı ancak geçerli nakliye güzergahı içeren satırlar ayrıştırılamadı. Lütfen şoför mesaj formatından emin olun.")
+    else:
+        st.error("Dosya içeriği okunamadı.")
